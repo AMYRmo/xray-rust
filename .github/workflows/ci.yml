@@ -829,6 +829,9 @@ jobs:
     if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
     runs-on: ubuntu-24.04
     timeout-minutes: 75
+    # Needed only by the draft-release step below (manual dispatch).
+    permissions:
+      contents: write
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -886,6 +889,23 @@ jobs:
             :xraymobile:lintDebug \
             --dependency-verification strict \
             --no-daemon
+
+      # Fork addition (AMYRmo): on a manual dispatch, publish the built
+      # AAR as a draft release so the amNG build can pick it up. Gated to
+      # workflow_dispatch so PRs and scheduled runs never create releases.
+      - name: Publish AAR as draft release
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          AAR="platform/android/xraymobile/build/outputs/aar/xraymobile-debug.aar"
+          ls -la "$AAR"
+          SHORT="$(git rev-parse --short HEAD)"
+          gh release create "aar-amyr-ech-$SHORT" "$AAR" \
+            --draft \
+            --title "xraymobile AAR amyr/ech $SHORT" \
+            --notes "Built from branch amyr/ech at $GITHUB_SHA. ECH slice 1 (pinned echConfigList) plus the unshaped-hello fallback. Debug AAR." || \
+          gh release upload "aar-amyr-ech-$SHORT" "$AAR" --clobber
 
   supply-chain:
     if: github.event_name != 'push' || github.ref_type != 'tag' || contains(github.ref_name, '-rc.')
