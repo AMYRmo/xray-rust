@@ -984,14 +984,23 @@ fn build_client_config(
         Some(list) => Some(resolve_ech_config(list)?),
         None => None,
     };
-    let client_config = match crate::utls_tls::shaping_profile(config.fingerprint.as_deref())? {
+    // A shaped (uTLS) ClientHello and managed ECH do not compose in the
+    // vendored rustls: every shaped profile (chrome, firefox, safari) is
+    // rejected by the server -- the handshake fails decrypting the
+    // ServerHello, i.e. ECH rejection -- while the stock rustls hello
+    // completes the handshake with ECH (proven live against Cloudflare).
+    // Fall back to the unshaped hello when ECH is on, so the connection
+    // works and the SNI is actually encrypted; the fingerprint is
+    // secondary. The shaped-only ECH prerequisites below (GREASE
+    // suppression, TLS 1.2 drop) stay in place for the day the
+    // underlying incompatibility is fixed.
+    let shaped = if ech.is_some() {
+        None
+    } else {
+        crate::utls_tls::shaping_profile(config.fingerprint.as_deref())?
+    };
+    let client_config = match shaped {
         Some((fingerprint, profile)) => {
-            if ech.is_some() && !profile_offers_tls13(profile) {
-                return Err(TransportError::TlsConfig(
-                    "ECH requires a TLS 1.3 fingerprint; the configured fingerprint only offers TLS 1.2"
-                        .to_owned(),
-                ));
-            }
             let versions = profile_protocol_versions(profile);
             let provider = Arc::new(shaping_crypto_provider());
             reject_unnegotiable_fingerprint(fingerprint, profile, &provider, versions)?;
@@ -1541,16 +1550,49 @@ mod http3_tests {
         haystack.windows(needle.len()).any(|window| window == needle)
     }
 
+    /// Extension types of a first-flight ClientHello record, in wire order.
+    fn hello_extension_types(record: &[u8]) -> Vec<(u16, usize)> {
+        assert_eq!(record[0], 22, "not a handshake record");
+        assert_eq!(record[5], 1, "not a ClientHello");
+        let mut p = 9 + 2 + 32; // hello version + random
+        let sid_len = record[p] as usize;
+        p += 1 + sid_len;
+        let cs_len = u16::from_be_bytes([record[p], record[p + 1]]) as usize;
+        p += 2 + cs_len;
+        let comp_len = record[p] as usize;
+        p += 1 + comp_len;
+        let ext_total = u16::from_be_bytes([record[p], record[p + 1]]) as usize;
+        p += 2;
+        let ext_end = p + ext_total;
+        assert_eq!(ext_end, record.len(), "extensions overrun the record");
+        let mut out = Vec::new();
+        while p < ext_end {
+            let ty = u16::from_be_bytes([record[p], record[p + 1]]);
+            let ln = u16::from_be_bytes([record[p + 2], record[p + 3]]) as usize;
+            out.push((ty, ln));
+            p += 4 + ln;
+        }
+        assert_eq!(p, ext_end, "extension walk overran");
+        out
+    }
+
+    fn is_grease(ty: u16) -> bool {
+        // GREASE values are 0x?a?a.
+        ty & 0x0f0f == 0x0a0a
+    }
+
     #[test]
-    fn ech_pinned_list_shaped_hello_hides_inner_sni() {
+    fn ech_pinned_list_shaped_fingerprint_falls_back_to_unshaped() {
+        // A shaped (uTLS) hello and managed ECH do not compose: every
+        // shaped profile is rejected by the server (live, against
+        // Cloudflare), while the stock rustls hello completes the ECH
+        // handshake. So a shaped fingerprint + ECH must build the
+        // unshaped hello: ECH present, outer SNI present, inner SNI
+        // hidden, and no shaped markers (no trust-anchors extension, no
+        // GREASE extensions, small key share).
         let record = plain_tls_client_hello_bytes(&ech_config("chrome", CLOUDFLARE_ECH))
-            .unwrap_or_else(|error| panic!("ECH shaped hello: {error}"));
+            .unwrap_or_else(|error| panic!("ECH fallback hello: {error}"));
         let hello = &record[5..];
-        // The outer SNI is the ECH config's public_name, and the extension
-        // itself (type 0xfe0d) is present; the real (inner) name must not
-        // appear in cleartext anywhere in the first flight. The shaped
-        // profile's GREASE ECH would conflict with managed ECH if it were
-        // not suppressed, so building the hello at all proves the suppression.
         assert!(contains(hello, b"cloudflare-ech.com"), "outer SNI missing");
         assert!(
             contains(hello, &[0xfe, 0x0d]),
@@ -1559,6 +1601,24 @@ mod http3_tests {
         assert!(
             !contains(hello, b"www.cloudflare.com"),
             "inner SNI leaked in cleartext"
+        );
+        let exts = hello_extension_types(&record);
+        assert!(
+            !exts.iter().any(|(ty, _)| *ty == 0xca34),
+            "trust-anchors extension present: shaped hello leaked through"
+        );
+        assert!(
+            !exts.iter().any(|(ty, _)| is_grease(*ty)),
+            "GREASE extension present: shaped hello leaked through"
+        );
+        let key_share_len = exts
+            .iter()
+            .find(|(ty, _)| *ty == 0x0033)
+            .map(|(_, ln)| *ln)
+            .expect("key_share extension missing");
+        assert!(
+            key_share_len < 100,
+            "key_share too large ({key_share_len}): shaped hello leaked through"
         );
     }
 
@@ -1588,12 +1648,17 @@ mod http3_tests {
     }
 
     #[test]
-    fn ech_rejects_tls12_fingerprint() {
-        let error = plain_tls_client_hello_bytes(&ech_config("android", CLOUDFLARE_ECH))
-            .unwrap_err();
+    fn ech_tls12_fingerprint_falls_back_to_unshaped() {
+        // A TLS-1.2-only fingerprint + ECH used to be a hard error; with
+        // the shaped fallback it builds the unshaped hello instead, and
+        // the ECH extension is still present.
+        let record = plain_tls_client_hello_bytes(&ech_config("android", CLOUDFLARE_ECH))
+            .unwrap_or_else(|error| panic!("ECH fallback hello: {error}"));
+        let hello = &record[5..];
         assert!(
-            error.to_string().contains("TLS 1.3"),
-            "unexpected error: {error}"
+            contains(hello, &[0xfe, 0x0d]),
+            "ECH extension missing from the outer hello"
         );
+        assert!(contains(hello, b"cloudflare-ech.com"), "outer SNI missing");
     }
 }
