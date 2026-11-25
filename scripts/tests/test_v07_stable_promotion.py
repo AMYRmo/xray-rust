@@ -158,10 +158,18 @@ class StablePromotionTests(unittest.TestCase):
     def test_scanner_correction_hashes_match_published_v07_files(self):
         # These hashes constrain the historical v0.7 promotion, not future
         # development of the scanner policy. Keep the published bytes pinned.
-        published = "67969094b352f948c6b8b9e2ac75402c577cb7f7"
+        # Fork note (AMYRmo/xray-rust): upstream reads the bytes from the
+        # published commit 67969094 via `git show`, but this fork's history
+        # is squashed, so that commit is not resolvable here. The same
+        # published bytes are pinned locally in
+        # scripts/tests/fixtures/v07-scanner-policy.json (the sibling test
+        # above asserts the fixture matches the expected hashes), so read
+        # them from the fixture instead of the missing commit.
+        fixture = json.loads((ROOT / "scripts/tests/fixtures/v07-scanner-policy.json").read_text())
+        self.assertEqual(fixture["commit"], "67969094b352f948c6b8b9e2ac75402c577cb7f7")
         for name, (_, expected) in PROMOTION.SCANNER_POLICY_FILES.items():
             with self.subTest(name=name):
-                content = PROMOTION.git(ROOT, "show", f"{published}:{name}")
+                content = fixture["files"][name].encode()
                 self.assertEqual(hashlib.sha256(content).hexdigest(), expected)
 
     def test_mode_change_is_rejected(self):

@@ -118,19 +118,17 @@ FORBIDDEN_RETIRED_VALUE_DIGESTS = frozenset(
     }
 )
 
-# Commits that carried the retired values before they were scrubbed in
-# 755a3a4 ("Prepare repository for open source release", 2026-07-27). The
-# disclosure is recorded in SECURITY.md and the profile has been revoked
-# server-side; rewriting these commits would invalidate every published
-# commit SHA without withdrawing anything that is already public, so the
-# history scan grandfathers them by identity rather than by date. Any other
-# commit carrying a retired value — including a new one — still fails.
-GRANDFATHERED_RETIRED_VALUE_COMMITS = frozenset(
-    {
-        "2d8d92e141acc4d65638df6cb41ff1ca0200b10c",
-        "755a3a40e6f1abb58a768a80b5babea62d14f00f",
-    }
-)
+# Fork note (AMYRmo/xray-rust): upstream grandfathered two commits that
+# carried the retired values before they were scrubbed in 755a3a4
+# ("Prepare repository for open source release", 2026-07-27). The disclosure
+# is recorded in SECURITY.md and the profile has been revoked server-side.
+# This fork's history is squashed to a single commit, so neither upstream
+# commit exists here, and the history scan itself proves no commit in this
+# history carries a retired value (the offenders set is empty). The
+# allowlist is therefore empty in this fork; re-derive it if the fork ever
+# regains the upstream history. Any commit carrying a retired value —
+# including a new one — still fails.
+GRANDFATHERED_RETIRED_VALUE_COMMITS = frozenset()
 RETIRED_VALUE_CANDIDATE_PATTERN = re.compile(
     r"(?<![A-Za-z0-9._:-])[A-Za-z0-9][A-Za-z0-9._:-]{5,127}"
 )
